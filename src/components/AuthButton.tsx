@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { SpotifyAuth } from "@/lib/spotify";
 import { LogOut, LogIn } from "lucide-react";

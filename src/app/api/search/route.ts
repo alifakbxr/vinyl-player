@@ -11,13 +11,13 @@ interface SpotifyTrack {
     images: Array<{ url: string }>;
   };
   preview_url: string | null;
+  external_urls: {
+    spotify: string;
+  };
+  uri: string;
+  duration_ms: number;
 }
 
-interface SearchResponse {
-  tracks: {
-    items: SpotifyTrack[];
-  };
-}
 
 async function getSpotifyAccessToken(): Promise<string> {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
@@ -65,6 +65,10 @@ async function searchWithUserToken(accessToken: string, query: string) {
       artist: track.artists[0]?.name || "Unknown Artist",
       album_cover: track.album.images[0]?.url || "https://via.placeholder.com/300x300?text=No+Image",
       preview_url: track.preview_url,
+      spotify_uri: track.uri,
+      spotify_url: track.external_urls.spotify,
+      duration_ms: track.duration_ms,
+      is_full_track_available: false, // Client credentials don't provide full track access
     }));
   } catch (error) {
     console.error("User token search failed:", error);
@@ -90,6 +94,10 @@ async function searchWithClientCredentials(query: string) {
     artist: track.artists[0]?.name || "Unknown Artist",
     album_cover: track.album.images[0]?.url || "https://via.placeholder.com/300x300?text=No+Image",
     preview_url: track.preview_url,
+    spotify_uri: track.uri,
+    spotify_url: track.external_urls.spotify,
+    duration_ms: track.duration_ms,
+    is_full_track_available: !!track.preview_url, // For now, use preview availability as indicator
   }));
 }
 
@@ -105,7 +113,17 @@ export async function GET(request: NextRequest) {
     // Check if Spotify credentials are configured
     if (!process.env.SPOTIFY_CLIENT_ID || !process.env.SPOTIFY_CLIENT_SECRET) {
       return NextResponse.json({
-        error: "Spotify API not configured. Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env file.",
+        error: "Spotify API not configured. Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env file with valid credentials from https://developer.spotify.com/dashboard",
+        tracks: []
+      }, { status: 503 });
+    }
+
+    // Check if credentials are still placeholder values
+    if (process.env.SPOTIFY_CLIENT_ID === "your_actual_client_id_here" ||
+        process.env.SPOTIFY_CLIENT_SECRET === "your_actual_client_secret_here" ||
+        process.env.SPOTIFY_CLIENT_ID === "a703c5ee2c4e44f388684d905e8ba99c") {
+      return NextResponse.json({
+        error: "Spotify API credentials are still set to placeholder values. Please replace them with real credentials from your Spotify app dashboard.",
         tracks: []
       }, { status: 503 });
     }
@@ -126,16 +144,41 @@ export async function GET(request: NextRequest) {
     }
 
     // Get a valid access token (user token if available, otherwise client credentials)
-    const validAccessToken = await SpotifyAuth.getValidAccessToken(userTokens);
+    const tokenResult = await SpotifyAuth.getValidAccessToken(userTokens);
 
     let tracks;
-    if (validAccessToken && userTokens) {
+    if (tokenResult && userTokens) {
       // Use user token for authenticated search (more results, better data)
-      tracks = await searchWithUserToken(validAccessToken, query);
+      tracks = await searchWithUserToken(tokenResult.accessToken, query);
+
+      // If token was refreshed, update cookies
+      if (tokenResult.updatedTokens) {
+        const response = NextResponse.json({ tracks });
+        const expiresAt = tokenResult.updatedTokens.expires_at;
+
+        response.cookies.set("spotify_access_token", tokenResult.updatedTokens.access_token, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === "production",
+          sameSite: "lax",
+          maxAge: Math.floor((expiresAt - Date.now()) / 1000),
+        });
+
+        response.cookies.set("spotify_token_expires", expiresAt.toString(), {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === "production",
+          sameSite: "lax",
+          maxAge: Math.floor((expiresAt - Date.now()) / 1000),
+        });
+
+        return response;
+      }
     } else {
       // Fall back to client credentials (public search)
       tracks = await searchWithClientCredentials(query);
     }
+
+    // Return the response
+    return NextResponse.json({ tracks });
 
     return NextResponse.json({ tracks });
   } catch (error) {
@@ -147,6 +190,27 @@ export async function GET(request: NextRequest) {
         error: error.message,
         tracks: []
       }, { status: 503 });
+    }
+
+    // Handle specific Spotify API errors
+    if (axios.isAxiosError(error) && error.response) {
+      const status = error.response.status;
+      if (status === 401) {
+        return NextResponse.json({
+          error: "Authentication failed. Please log out and log back in with Spotify.",
+          tracks: []
+        }, { status: 401 });
+      } else if (status === 429) {
+        return NextResponse.json({
+          error: "Rate limit exceeded. Please try again in a moment.",
+          tracks: []
+        }, { status: 429 });
+      } else if (status >= 500) {
+        return NextResponse.json({
+          error: "Spotify service is temporarily unavailable. Please try again later.",
+          tracks: []
+        }, { status: 502 });
+      }
     }
 
     // For other errors, return a generic error message

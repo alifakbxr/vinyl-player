@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Search, Play, Pause } from "lucide-react";
+import { Search, Play, Pause, ExternalLink } from "lucide-react";
 import { VinylRecord } from "@/components/VinylRecord";
 import { Tonearm } from "@/components/Tonearm";
 import { AuthButton } from "@/components/AuthButton";
@@ -15,6 +15,10 @@ interface Track {
   artist: string;
   album_cover: string;
   preview_url: string;
+  spotify_uri?: string;
+  spotify_url?: string;
+  duration_ms?: number;
+  is_full_track_available?: boolean;
 }
 
 export default function Home() {
@@ -26,6 +30,16 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [useFullTrack, setUseFullTrack] = useState(false);
+
+  // Utility function to format time
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
 
   // Check authentication status on mount
   useEffect(() => {
@@ -46,6 +60,24 @@ export default function Home() {
     checkAuth();
   }, []);
 
+  // Check if Spotify API is configured
+  useEffect(() => {
+    const checkConfig = async () => {
+      try {
+        const response = await fetch("/api/search?q=test");
+        if (response.status === 503) {
+          const data = await response.json();
+          console.warn("Spotify API configuration issue:", data.error);
+        }
+      } catch (error) {
+        // Ignore errors during config check
+      }
+    };
+
+    // Small delay to avoid interfering with auth check
+    setTimeout(checkConfig, 1000);
+  }, []);
+
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
 
@@ -59,10 +91,20 @@ export default function Home() {
       } else {
         console.error("Search failed:", data.error);
         setSearchResults([]);
+
+        // Show user-friendly error messages for specific cases
+        if (response.status === 401) {
+          alert("Authentication expired. Please log out and log back in with Spotify.");
+        } else if (response.status === 503) {
+          alert("Spotify API is not configured. Please check your environment variables.");
+        } else if (response.status >= 500) {
+          alert("Server error. Please try again in a moment.");
+        }
       }
     } catch (error) {
       console.error("Search error:", error);
       setSearchResults([]);
+      alert("Network error. Please check your connection and try again.");
     } finally {
       setIsLoading(false);
     }
@@ -71,28 +113,111 @@ export default function Home() {
   const handleTrackSelect = (track: Track) => {
     setCurrentTrack(track);
     setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+
+    // Determine if we should use full track or preview
+    const shouldUseFullTrack = isAuthenticated && (track.is_full_track_available !== false) && !!track.spotify_url;
+    setUseFullTrack(shouldUseFullTrack);
+
     if (audio) {
       audio.pause();
+      audio.removeEventListener("ended", () => setIsPlaying(false));
+      audio.removeEventListener("timeupdate", () => setCurrentTime(audio.currentTime));
+      audio.removeEventListener("loadedmetadata", () => setDuration(audio.duration));
+      audio.removeEventListener("error", handleAudioError);
+      audio.src = "";
       setAudio(null);
+    }
+  };
+
+  const handleAudioError = (e?: Event) => {
+    console.error("Audio playback failed:", e);
+    setIsPlaying(false);
+
+    if (audio) {
+      audio.pause();
+      audio.removeEventListener("ended", () => setIsPlaying(false));
+      audio.removeEventListener("timeupdate", () => setCurrentTime(audio.currentTime));
+      audio.removeEventListener("loadedmetadata", () => setDuration(audio.duration));
+      audio.removeEventListener("error", handleAudioError);
+      audio.src = "";
+      setAudio(null);
+    }
+
+    // Provide specific error messages based on the situation
+    if (isAuthenticated && currentTrack?.spotify_url) {
+      alert("Preview not available. Click 'Play on Spotify' to listen to the full track.");
+    } else if (currentTrack?.preview_url) {
+      alert("Audio format not supported. Please try another track.");
+    } else {
+      alert("This track doesn't have a preview available.");
     }
   };
 
   const handlePlayPause = () => {
     if (!currentTrack) return;
 
+    // If user is authenticated and full track is available, open in Spotify
+    if (useFullTrack && currentTrack.spotify_url) {
+      window.open(currentTrack.spotify_url, '_blank');
+      return;
+    }
+
+    // Otherwise, use preview playback
+    if (!currentTrack.preview_url) {
+      if (isAuthenticated && currentTrack.spotify_url) {
+        const shouldOpenSpotify = confirm("Preview not available. Would you like to open this track in Spotify?");
+        if (shouldOpenSpotify) {
+          window.open(currentTrack.spotify_url, '_blank');
+        }
+      } else {
+        alert("This track doesn't have a preview available.");
+      }
+      return;
+    }
+
     if (isPlaying) {
       audio?.pause();
       setIsPlaying(false);
     } else {
       if (audio) {
-        audio.play();
+        audio.play().catch(() => {
+          console.error("Audio playback failed");
+          handleAudioError();
+        });
         setIsPlaying(true);
       } else {
         const newAudio = new Audio(currentTrack.preview_url);
+
+        // Add event listeners before attempting to play
         newAudio.addEventListener("ended", () => setIsPlaying(false));
-        newAudio.play();
+        newAudio.addEventListener("timeupdate", () => setCurrentTime(newAudio.currentTime));
+        newAudio.addEventListener("loadedmetadata", () => setDuration(newAudio.duration));
+        newAudio.addEventListener("error", handleAudioError);
+
+        // Validate the audio source before playing
+        newAudio.addEventListener("loadeddata", () => {
+          if (newAudio.readyState >= 2) { // HAVE_CURRENT_DATA or higher
+            newAudio.play().catch((error) => {
+              console.error("Audio playback failed:", error);
+              handleAudioError();
+            });
+            setIsPlaying(true);
+          } else {
+            console.warn("Audio data not ready");
+            handleAudioError();
+          }
+        });
+
+        // Handle case where audio fails to load
+        newAudio.addEventListener("abort", () => {
+          console.warn("Audio loading aborted");
+          handleAudioError();
+        });
+
+        newAudio.load(); // Explicitly load the audio
         setAudio(newAudio);
-        setIsPlaying(true);
       }
     }
   };
@@ -161,7 +286,7 @@ export default function Home() {
               </div>
 
               {/* Play/Pause Controls */}
-              <div className="flex justify-center mt-8">
+              <div className="flex justify-center mt-8 gap-4">
                 <Button
                   onClick={handlePlayPause}
                   size="lg"
@@ -174,6 +299,18 @@ export default function Home() {
                     <Play className="w-8 h-8 ml-1" />
                   )}
                 </Button>
+
+                {/* Play on Spotify button for authenticated users */}
+                {isAuthenticated && currentTrack?.spotify_url && (
+                  <Button
+                    onClick={() => window.open(currentTrack.spotify_url, '_blank')}
+                    size="lg"
+                    variant="outline"
+                    className="rounded-full w-20 h-20 shadow-lg hover:shadow-xl transition-shadow"
+                  >
+                    <ExternalLink className="w-8 h-8" />
+                  </Button>
+                )}
               </div>
             </Card>
           </div>
@@ -188,8 +325,28 @@ export default function Home() {
                     <h4 className="font-medium text-slate-800">{currentTrack.title}</h4>
                     <p className="text-slate-600">{currentTrack.artist}</p>
                   </div>
-                  <div className="text-sm text-slate-500">
-                    <p>Duration: 30s preview</p>
+                  <div className="text-sm text-slate-500 space-y-2">
+                    {useFullTrack ? (
+                      <p>Full track available on Spotify</p>
+                    ) : (
+                      <>
+                        <p>Duration: {currentTrack.duration_ms ? formatTime(currentTrack.duration_ms / 1000) : '30s preview'}</p>
+                        {duration > 0 && (
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span>{formatTime(currentTime)}</span>
+                              <span>{formatTime(duration)}</span>
+                            </div>
+                            <div className="w-full bg-slate-200 rounded-full h-1">
+                              <div
+                                className="bg-slate-600 h-1 rounded-full transition-all duration-100"
+                                style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
+                              ></div>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
                     <p>Status: {isPlaying ? "Playing" : "Paused"}</p>
                   </div>
                 </div>
@@ -212,17 +369,33 @@ export default function Home() {
                   {searchResults.map((track) => (
                     <div
                       key={track.id}
-                      className="flex items-center gap-3 p-3 rounded-lg hover:bg-slate-50 cursor-pointer transition-colors"
-                      onClick={() => handleTrackSelect(track)}
+                      className={`flex items-center gap-3 p-3 rounded-lg hover:bg-slate-50 transition-colors ${
+                        track.preview_url ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'
+                      }`}
+                      onClick={() => track.preview_url && handleTrackSelect(track)}
                     >
                       <img
                         src={track.album_cover}
                         alt={track.title}
                         className="w-12 h-12 rounded object-cover"
+                        onError={(e) => {
+                          const target = e.target as HTMLImageElement;
+                          if (target.src !== "https://via.placeholder.com/300x300?text=No+Image") {
+                            target.src = "https://via.placeholder.com/300x300?text=No+Image";
+                          }
+                        }}
+                        loading="lazy"
                       />
                       <div className="flex-1 min-w-0">
                         <h4 className="font-medium text-sm truncate">{track.title}</h4>
                         <p className="text-xs text-slate-600 truncate">{track.artist}</p>
+                        {isAuthenticated && track.spotify_url ? (
+                          <p className="text-xs text-green-600">Full track available</p>
+                        ) : !track.preview_url ? (
+                          <p className="text-xs text-orange-600">No preview available</p>
+                        ) : (
+                          <p className="text-xs text-blue-600">Preview available</p>
+                        )}
                       </div>
                     </div>
                   ))}

@@ -46,7 +46,7 @@ export class SpotifyAuth {
     }
   }
 
-  static async getValidAccessToken(tokens: SpotifyTokens | null): Promise<string | null> {
+  static async getValidAccessToken(tokens: SpotifyTokens | null): Promise<{ accessToken: string; updatedTokens?: SpotifyTokens } | null> {
     // If no tokens, return null (will fall back to client credentials)
     if (!tokens) {
       return null;
@@ -54,13 +54,16 @@ export class SpotifyAuth {
 
     // If token is still valid, return it
     if (Date.now() < tokens.expires_at) {
-      return tokens.access_token;
+      return { accessToken: tokens.access_token };
     }
 
     // If token is expired, try to refresh it
     try {
       const newTokens = await this.refreshAccessToken(tokens.refresh_token);
-      return newTokens.access_token;
+      return {
+        accessToken: newTokens.access_token,
+        updatedTokens: newTokens
+      };
     } catch (error) {
       console.error("Failed to refresh token:", error);
       return null; // Fall back to client credentials
